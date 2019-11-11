@@ -1,0 +1,586 @@
+/*================================================================================================================
+ * Robot Program for Team 8 in MME4487. 
+ * 
+ * 
+ * //Programmed by Fernando Ragone//
+=================================================================================================================*/
+#include "p24HJ128GP502.h"  //Include device library file
+#include "timer.h"          //Include TIMER library file
+#include "uart.h"           //Include UART library file
+#include "adc.h"            //Include ADC library file
+#include "outcompare.h"		//REVISED BY Andrew 10/29/19 Include Output Compare (PWM) library file
+
+#define BUFF_SIZE 32
+#define SERVO_MAX 3848
+#define SERVO_MIN 3036
+
+//Configuration Bits
+_FOSCSEL(FNOSC_FRC & IESO_OFF);
+_FOSC	(POSCMD_NONE & OSCIOFNC_ON & IOL1WAY_OFF & FCKSM_CSDCMD);
+_FWDT	(FWDTEN_OFF & WINDIS_OFF & WDTPRE_PR32 & WDTPOST_PS1);
+_FPOR	(FPWRT_PWR1 & ALTI2C_ON);
+_FICD	(ICS_PGD1 & JTAGEN_OFF);
+
+//Function prototypes
+void InitIO (void);									
+void InitTimer (void);				
+void InitUART(void);
+void ADC (void);				
+void ProcessData(void);
+void SendData(void);
+long Map(long x, long in_min, long in_max, long out_min, long out_max);
+void Shutdown(void);
+void InitPWM(void);  //REVISED BY Andrew 10/29/19 function prototype for PWM 
+void Drive(void);    //REVISED BY Andrew 10/29/19 function prototype for drive
+void ArmPosition(void);//function prototype for arm movements 
+void Compare(void);     //function to compare Line tracker readings 
+
+//Global variables
+unsigned int Magnet = 0;                 //Variable sent to the Robot PIC24H microcontroller via HC-05 Bluetooth Module
+unsigned int OFFTime = 3000;                //Variable used to control the period of the square wave	
+unsigned int TmrState = 0;                  //Variable used to store the state of the interrupt		
+unsigned int TmrVal = 0;                    //Variable used to store the value used to setup Timer1 which controls
+                                            //the ON and OFF time by utilizing Timer1's Interrupt
+//PWM Initilization 
+unsigned int PWM1 = 65535;	//REVISED BY Andrew 10/29/19 Initialize PWM1, used to store value of PWM Signal to motor 1 			
+unsigned int PWM2 = 65535;	//REVISED BY Andrew 10/29/19 Initialize PWM2, used to store value of PWM Signal to motor 2
+                            //Note the value of 65535 represents 100% Duty Cycle = motor off
+unsigned int Direction = 0; //REVISED BY Andrew 10/29/19 variable used to control the motor functions 
+
+
+//
+unsigned int AutoMode = 0;   //variable that will deterime if auto is switched on 
+unsigned int Vacuum = 0;    //to determine if vacuum will be on 
+unsigned int BasketONTIME =0;  //used to control position of basket servo 
+unsigned int ReturnArm = 0;     //used to determine if button is pressed to return arm to position over basket
+unsigned int ArmDirection = 0;  //used to control the arms rotation
+unsigned int PositionArm = 0;   //used to position arm to be ready for next pick up 
+
+//LimitSwitches 
+unsigned int ArmBasketLS = 0;   //Arm position over basket LS
+unsigned int ArmDriveLS = 0;    //Arm position ready to drive LS
+unsigned int ArmVertLS =0;      //Arm vertical position fully raised LS 
+
+//Linetracker 
+unsigned int LineLeft = 0;      //For ADC value from the left line tracking sensor
+unsigned int LineRight = 0;     //For ADC value from the right line tracking sensor	
+
+//comms init
+unsigned char SendDataArray[BUFF_SIZE];     //Array to store the data to be transmitted through UART1 TX pin
+unsigned char ReceiveDataArray[BUFF_SIZE];  //Array to store the data received from UART1 RX pin
+unsigned char ReceivedChar = 0;             //Variable used to store the last byte received from UART1 RX pin
+int i;                                      //Variable used to index through arrays
+int uartcount = 0;                          //The current array index of the received data from the UART RX pin
+
+unsigned int CommsLossCount = 0;            //Store the number of times there was a communication loss
+unsigned short Communicating;               //Store the value ReceiveDataArray[20], if 1 then new data received
+
+int main (void)
+{
+	InitIO();           //Call InitIO which configures the input and output pins
+	InitTimer();		//Call InitTimer which configures Timer1 for controlling the RC Servo Motor
+	InitUART();         //Call InitUART which configures the UART hardware module for communications
+                        //with the HC-05 Bluetooth Module
+    InitPWM();		    //REVISED BY Andrew 10/29/19 Call InitPWM function
+	
+	for (i=0; i<BUFF_SIZE; i++) SendDataArray[i] = 0;   //Initialize the array of chars to zero
+	SendDataArray[0] = 's';                             //Set first element as 's' for data synchronization
+                                                        //and for framing error checking
+	while (1)           //Infinite loop
+	{          
+
+       
+        ProcessData();	//Call ProcessData to update variables for UART1 Communications
+        SendData(); 	//Call SendData to send data through the UART1 TX pin to HC-05 Bluetooth Module
+
+        if(CommsLossCount>200){     //If communication loss persists, we assume complete loss of communication
+            Shutdown();             //You must define code in Shutdown function below
+        }
+        else
+        {                       //If there is communication, then the following code block will be executed
+                                    //This is where all your functions should be executed
+           //set all inputs to robot
+           ArmBasketLS =PORTAbits.RA2;   //Arm position over basket LS
+           ArmDriveLS = PORTAbits.RA3;    //Arm position ready to drive LS
+           ArmVertLS =  PORTBbits.RB4;  //Arm vertical position fully raised LS 
+            
+           ADC();                  //Call ADC which configures and reads AN0
+         
+        
+             
+           //Drive Mode - Auto or Manual
+           if(AutoMode == 1) //if auto is switched on then run line tracking function 
+             {
+               Compare(); //call compare function to drive itself over line 
+              }
+           else //else call drive function 
+             {
+              Drive();	//REVISED BY Andrew 10/29/19 Call Drive function, used to update PWM Hardware with new PWM signals    
+             } 
+           
+           //Vacuum ON/OFF 
+           if(Vacuum ==1)
+           {
+               LATBbits.LATB15 = 0;    //Enable vacuum motor to run 
+               SetDCOC2PWM(65535);      //Set duty cycle to max setting for pick up -- will change if the PWM is not set to max for when arm moves - shouldnt be an issue once picked up tho. 
+               
+           }
+           else 
+           {
+               LATBbits.LATB15 = 1;    //Enable vacuum motor to stop
+           }
+           
+           //Arm Movement automation 
+           if(ReturnArm ==1)
+           {
+               while(ArmVertLS !=1)     //raise arm until the top 
+               {
+                     LATAbits.LATA1 = 0;    //Enable vertical motor to run
+                     LATBbits.LATB1 = 1;    //Enable rotational motor to stop     
+                     LATBbits.LATB2 = 1;    //set direction of vertical motors to be 1 
+                     SetDCOC2PWM(PWM2);      //Set duty cycle PWM2
+               }
+               LATAbits.LATA1 = 1;    //Enable vertical motor to stop
+               while (ArmBasketLS !=0) //counter clockwise until arm over basket 
+               {
+                    LATAbits.LATA1 = 1;    //Enable vertical motor to stop
+                    LATBbits.LATB1 = 0;    //Enable rotational motor to run     
+                    LATBbits.LATB0 = 0;    //set direction of rotational motors to be 0 
+                    SetDCOC2PWM(PWM2);      //Set duty cycle PWM2
+               }
+               LATAbits.LATA1 = 1;    //Enable vertical motor to stop
+               LATBbits.LATB1 = 1;    //Enable rotational motor to stop 
+           }
+           else if (PositionArm == 1)
+           {
+               while(ArmVertLS !=1)     //make sure that its at the top still 
+               {
+                     LATAbits.LATA1 = 0;    //Enable vertical motor to run
+                     LATBbits.LATB1 = 1;    //Enable rotational motor to stop     
+                     LATBbits.LATB2 = 1;    //set direction of vertical motors to be 1 
+                     SetDCOC2PWM(PWM2);      //Set duty cycle PWM2
+               }
+               LATAbits.LATA1 = 1;    //Enable vertical motor to stop
+               while(ArmDriveLS !=1)            //spin clockwise back to drive position 
+               {
+                    LATAbits.LATA1 = 1;    //Enable vertical motor to stop
+                    LATBbits.LATB1 = 0;    //Enable rotational motor to run     
+                    LATBbits.LATB0 = 1;    //set direction of rotational motors to be 1 
+                    SetDCOC2PWM(PWM2);      //Set duty cycle PWM2
+               }
+               LATAbits.LATA1 = 1;    //Enable vertical motor to stop
+               LATBbits.LATB1 = 1;    //Enable rotational motor to stop  
+           }
+           else
+           {
+               ArmPosition(); //Call Arm Position Function
+           }
+        }
+    }
+}
+/*****************************************************************************************************************/
+void InitIO (void)
+{
+	//Drive Motors 
+    TRISBbits.TRISB14 = 0;	//REVISED BY Andrew 10/29/19 Set RB14 as output (PWM Signal for LEFT DRIVE Motors)
+	TRISBbits.TRISB13 = 0;	//REVISED BY Andrew 10/29/19 Set RB13 as output (Direction Signal for LEFT DRIVE Motors)
+	TRISBbits.TRISB12 = 0;	//REVISED BY Andrew 10/29/19 Set RB12 as output (PWM Signal for RIGHT DRIVE Motors)	
+	TRISBbits.TRISB11 = 0;	//REVISED BY Andrew 10/29/19 Set RB11 as output (Direction Signal for RIGHT DRIVE Motors)
+	TRISBbits.TRISB10 = 0;	//REVISED BY Andrew 10/29/19 Set RB10 as output (Enable Signal for DRIVE Motors LEFT AND RIGHT)
+    
+    //Arm Motors
+    TRISAbits.TRISA1 = 0;	//Set RA1 as output (Enable Signal for ARM Motors Vertical)
+    TRISBbits.TRISB0 = 0;	//Set RB0 as output (Direction Signal for Arm ROTATION Motor)
+	TRISBbits.TRISB1 = 0;	//Set RB1 as output (Enable Signal for ARM Motors Rotational)
+	TRISAbits.TRISA4 = 0;	//Set RB2 as output (Direction Signal for Arm VERTICAL Motor)	
+	TRISBbits.TRISB5 = 0;	//Set RB3 as output (PWM Signal for Arm BOTH VERTICAL AND ROTATIONAL Motor)
+	
+    //Vacuum Motor 
+    TRISBbits.TRISB15 = 0;	//Set RB15 as output (Enable Signal for Vacuum Motor)
+    //TRISAbits.TRISA4 = 0;	//Set RA5 as output (PWM Signal for Arm ROTATION Motor) will be using same pin as PWM for arm motors 
+    
+    //Basket Dump Servo 
+    TRISBbits.TRISB6 = 0;   //Set RB6 as output for basket RC Servo
+    
+    //Limit Switches 
+    TRISAbits.TRISA2 = 1;   //set RA2 input for Arm Vertical Position limit switch
+    TRISAbits.TRISA3 = 1;   //set RA3 input for Arm position over the collection basket limit switch
+    TRISBbits.TRISB4 = 1;	//Set RB4 input for Arm position ready for drive basket limit switch
+    
+    //Line Tracker 
+    TRISBbits.TRISB2 = 1;   //set RA0 input for Line Right
+    TRISBbits.TRISB3 = 1;	//Set RB5 input for Line Left 
+    
+    //Hall Sensor 
+    TRISAbits.TRISA0 = 1;   //Set RA0 as input for Hall Effect Sensor
+   
+    
+    //PWM Bits for Motors 
+    
+    RPOR7bits.RP14R = 18;	//Set RP14 as OC1 output on pin RB14 -- LEFT Motors
+	RPOR6bits.RP12R = 18;   //Set RP12 as OC1 output on pin RB12 -- RIGHT Motors 
+    
+   // will use one pin for both PWM signals  RPOR0bits.RP1R = 19;	//Set RP1 as OC2 output on pin RB1 -- Arm Rotational Motors
+	RPOR2bits.RP5R = 19;   //Set RP5 as OC2 output on pin RB3 -- Arm Vertical Motors and roataitonal and Vacuum PWM 
+    //vacuum motor will use OC2 for PWM (Same as arm PWM)
+   // RPOR7bits.RP15R = 19;   //Set RP3 as OC2 output on pin RB3 -- Vacuum Motor PWM  
+
+	LATBbits.LATB13 = 0;    //REVISED BY Andrew 10/29/19 Set the direction of motor 1 to be Forward
+	LATBbits.LATB11 = 0;    //REVISED BY Andrew 10/29/19 Set the direction of motor 2 to be Forward
+                            //(Note: May need to swap motor leads to have motor spin forward)
+
+    //Send/Receive Initialization
+	//RP8 TO U1RX           //Set the RP8 pin to UART1 RX pin
+	RPINR18bits.U1RXR = 8;	//See TABLE 11-1: SELECTABLE INPUT SOURCES (MAPS INPUT TO FUNCTION),Page 136
+                            //and REGISTER 11-8: RPINR18: PERIPHERAL PIN SELECT INPUT REGISTER 18,Page 146
+
+    CNPU2bits.CN22PUE = 1;	//Enable weak pull-up of Receive pin CN22 (Corresponds to RP8)
+                            //This is needed for v1.06 Bluetooth boards to pull up the receive line
+
+	//RP9 TO U1TX           //Set the RP9 pin to UART1 TX pin
+	RPOR4bits.RP9R = 3;     //See TABLE 11-2: OUTPUT SELECTION FOR REMAPPABLE PIN (RPn), Page 137
+                            //and REGISTER 11-19: RPOR4: PERIPHERAL PIN SELECT OUTPUT REGISTERS 4, Page 154
+}
+/*****************************************************************************************************************/
+void InitTimer(void)
+// For more information on PIC24H Timers Peripheral Module Library refer to link below:
+// file:///C:/Program%20Files%20(x86)/Microchip/xc16/v1.32/docs/periph_libs/dsPIC30F_dsPIC33F_PIC24H_dsPIC33E_PIC24E_Timers_Help.htm
+{                                                   //Prescaler = 1:8 and Period = 0x0FFF
+	OpenTimer1 (T1_ON & T1_PS_1_8 & T1_SYNC_EXT_OFF & T1_SOURCE_INT & T1_GATE_OFF & T1_IDLE_STOP, 0x0FFF);						
+	ConfigIntTimer1 (T1_INT_PRIOR_1 & T1_INT_ON);	//Set interrupt priority and turn Timer1 interrupt on
+}
+/*****************************************************************************************************************/
+void InitUART(void)
+// For more information on PIC24H UART Peripheral Module Library Help refer to link below:
+// file:///C:/Program%20Files%20(x86)/Microchip/xc16/v1.32/docs/periph_libs/dsPIC30F_dsPIC33F_PIC24H_dsPIC33E_PIC24E_UART_Help.htm
+{
+	IEC0bits.U1TXIE = 0;            //Disable UART1 TX interrupt
+    IFS0bits.U1RXIF = 0;            //Clear the Receive Interrupt Flag
+	U1MODEbits.STSEL = 0;           //1 Stop bit
+	U1MODEbits.PDSEL = 0;           //8-bit data, no parity
+	U1MODEbits.BRGH = 0;            //16x baud clock, Standard mode
+	U1MODEbits.URXINV = 0;          //Idle State 1 for RX pin
+	U1MODEbits.ABAUD = 0;           //Auto-Baud Disabled
+	U1MODEbits.RTSMD = 1;           //Simplex Mode, no flow control
+	U1MODEbits.UARTEN = 1;          //Enable UART1
+	U1STAbits.UTXISEL0 = 0;         //Interrupt after one TX character is transmitted
+	U1STAbits.UTXISEL1 = 0;         //Interrupt after one TX character is transmitted
+	U1STAbits.UTXEN = 1;            //Enable UART1 to control TX pin
+	U1BRG = 1;                      //BAUD Rate Setting for 115200
+	IEC0bits.U1RXIE = 1;            //Enable UART1 RX interrupt
+}
+/*****************************************************************************************************************/
+void ADC (void)
+// For more information on PIC24H ADC Peripheral Module Library refer to link below:
+// file:///C:/Program%20Files%20%28x86%29/Microchip/xc16/v1.32/docs/periph_libs/dsPIC33F_PIC24H_dsPIC33E_PIC24E_ADC_Library_Help.htm
+{                                   //12-bit sampling
+                                    //Use dedicated ADC RC oscillator
+                                    //Automatically start new conversion after previous
+                                    //Use Avdd and Avss as reference levels
+	/*//Hall Effect Sensor ADC 
+	OpenADC1(ADC_MODULE_OFF & ADC_AD12B_12BIT & ADC_FORMAT_INTG & ADC_CLK_AUTO & ADC_AUTO_SAMPLING_ON,
+		ADC_VREF_AVDD_AVSS & ADC_SCAN_OFF & ADC_ALT_INPUT_OFF,
+		ADC_SAMPLE_TIME_31 & ADC_CONV_CLK_INTERNAL_RC,
+		ADC_DMA_BUF_LOC_1,
+		ENABLE_AN0_ANA,
+		0,		
+		0,
+		0);
+                                    //Select AN0
+	SetChanADC1(0, ADC_CH0_NEG_SAMPLEA_VREFN & ADC_CH0_POS_SAMPLEA_AN0);
+	AD1CON1bits.ADON = 1;           //Turn on ADC hardware module
+	while (AD1CON1bits.DONE == 0);	//Wait until conversion is done
+	Magnet = ReadADC1(0);              // set magnet to digital value
+	AD1CON1bits.ADON = 0;           //Turn off ADC hardware module
+     * */ //WILL POSSIBLY NEED TO ADC BUT MAY NOT NEED TO DEPENDING WHAT SIGNAL WE GET 
+    OpenADC1( ADC_MODULE_OFF & ADC_AD12B_12BIT & ADC_FORMAT_INTG & ADC_CLK_AUTO & ADC_AUTO_SAMPLING_ON,
+			  ADC_VREF_AVDD_AVSS & ADC_SCAN_OFF & ADC_ALT_INPUT_OFF,
+			  ADC_SAMPLE_TIME_31 & ADC_CONV_CLK_INTERNAL_RC,
+			  ADC_DMA_BUF_LOC_1,
+			  ENABLE_AN4_ANA,
+			  0,
+			  0,
+			  0 );
+                                    //Select AN4
+	SetChanADC1(0, ADC_CH0_NEG_SAMPLEA_VREFN & ADC_CH0_POS_SAMPLEA_AN4);
+	AD1CON1bits.ADON = 1;       	//Turn on ADC hardware module
+	while (AD1CON1bits.DONE == 0);  //Wait until conversion is done
+	LineLeft = ReadADC1(0);     	//Read conversion results and store in LineLeft
+	AD1CON1bits.ADON = 0;           //Turn off ADC hardware module
+							
+	OpenADC1( ADC_MODULE_OFF & ADC_AD12B_12BIT & ADC_FORMAT_INTG & ADC_CLK_AUTO & ADC_AUTO_SAMPLING_ON,
+			  ADC_VREF_AVDD_AVSS & ADC_SCAN_OFF & ADC_ALT_INPUT_OFF,
+			  ADC_SAMPLE_TIME_31 & ADC_CONV_CLK_INTERNAL_RC,
+			  ADC_DMA_BUF_LOC_1,
+			  ENABLE_AN5_ANA,
+			  0,
+			  0,
+			  0 );
+                                    //Select AN5
+	SetChanADC1(0, ADC_CH0_NEG_SAMPLEA_VREFN & ADC_CH0_POS_SAMPLEA_AN5);
+	AD1CON1bits.ADON = 1;           //Turn on ADC hardware module
+	while (AD1CON1bits.DONE == 0);	//Wait until conversion is done
+	LineRight = ReadADC1(0);        //Read conversion results and store in LineRight
+	AD1CON1bits.ADON = 0;           //Turn off ADC hardware module
+    
+}
+/*****************************************************************************************************************/
+void ProcessData(void)
+{	
+    //Switches receive data 
+	AutoMode = ReceiveDataArray[1];
+    Vacuum = ReceiveDataArray[3];
+    BasketONTIME = (ReceiveDataArray[2] << 8) + ReceiveDataArray[17];
+    
+    //LED send data 
+    Magnet = PORTAbits.RA0; 
+    SendDataArray[4] = (Magnet >>8);      // Hall Effect sensor 
+	SendDataArray[5] = Magnet;
+    SendDataArray[14] = ArmBasketLS;
+    
+    //PWM Receive 
+    PWM1 = (ReceiveDataArray[6] <<8) + ReceiveDataArray[7];     //REVISED BY Andrew 10/29/19 Build integer from array of bytes for PWM1
+    PWM2 = (ReceiveDataArray[12] <<8) + ReceiveDataArray[13];     //REVISED BY Andrew 10/29/19 Build integer from array of bytes for PWM2
+    
+    //Automation Push Buttons receive
+    ReturnArm = ReceiveDataArray[15];   //Variable for returning arm over basket 
+    PositionArm = ReceiveDataArray[16]; // variable for positioning arm back to drive position 
+    
+    //DirectionBits
+    Direction = (ReceiveDataArray[8] <<8) + ReceiveDataArray[9];//REVISED BY Andrew 10/29/19 Build integer from array of bytes for Direction
+    ArmDirection = (ReceiveDataArray[10] <<8) + ReceiveDataArray[11];
+    
+    
+    SendDataArray[20] = 1;                  //Sending a 1 for controller to check for communication
+    Communicating = ReceiveDataArray[20];   //Checking if the controller sent us a 1, which will let us know if we
+                                            //have communication    
+    
+    if(Communicating){                      //If there is communication, reset the communication loss counter
+        CommsLossCount = 0;
+    }
+    else if(!Communicating){                //If there is an interruption (i.e. single loss of communication),
+        CommsLossCount++;                   //then increment the communication loss counter
+    }
+    ReceiveDataArray[20] = 0;               //Reset the communication to 0, If next time we look at it and it's 
+                                            //still 0, then no communication. If next time we look at it and
+                                            //controller has changed it to 1, then we have communication
+    
+}
+/*****************************************************************************************************************/
+void SendData(void)
+{
+	for (i=0;i<BUFF_SIZE;i++)           //Index through the array from the start to the end of the array 
+	{                                   //Note: The first byte is an ASCII Character "s" to denote the start
+		WriteUART1(SendDataArray[i]);	//Send one byte of the data array to UART TX Pin
+		while(BusyUART1());             //Wait while the UART1 is busy
+	}
+}
+/*****************************************************************************************************************/
+long Map(long x, long in_min, long in_max, long out_min, long out_max)
+{
+    return (x-in_min)*(out_max-out_min)/(in_max-in_min)+out_min;
+}
+/*****************************************************************************************************************/
+void Shutdown(void){
+    //Enter your code to disable/stop anything that could potentially keep running
+    //This is incase of disconnect between Bluetooth modules
+    //Generally, if a pair of modules lose communication, the main program will likely continue to
+    //do what it was last told to do.
+    //This function will therefore be called in the case that communication is lost
+    
+    LATAbits.LATA4 = 1;     //Turn on communication error LED 
+}
+/*****************************************************************************************************************/
+void __attribute__((interrupt, auto_psv)) _T1Interrupt(void)	
+{
+	DisableIntT1;               //Disable Timer1 interrupt 
+
+//This if statement is used to control the next state of the interrupt
+	if (TmrState == 0)
+	{
+		LATBbits.LATB6 = 1;     //Set high signal for RB6
+		T1CONbits.TCKPS = 1;	//Change prescaler to 1:8
+		TmrVal = BasketONTIME;        //Set TmrVal = BasketONTIME to control RC Servo for basket dumping 
+		TmrState = 1;           //Set next state for the interrupt
+	}
+	else if (TmrState == 1)
+	{
+		LATBbits.LATB6 = 0;     //Set low signal for RB6
+		TmrVal = OFFTime;       //Set TmrVal = OFFTime
+		T1CONbits.TCKPS = 2;	//Change prescaler to 1:64
+		TmrState = 0;           //Set next state for the interrupt
+	}	
+	WriteTimer1(TmrVal);		//Setup Timer1 with the appropriate value to set the interrupt time
+	IFS0bits.T1IF = 0;          //Reset Timer1 interrupt flag
+	EnableIntT1;                //Enable Timer1 interrupt
+}
+/*****************************************************************************************************************/
+// UART1 Receive Interrupt
+void __attribute__ ((interrupt, no_auto_psv)) _U1RXInterrupt(void) 
+{
+	DisableIntU1RX;             //Disable the UART1 receive interrupt
+	IFS0bits.U1RXIF = 0;        //Reset the UART1 receive interrupt flag
+	ReceivedChar = U1RXREG;     //Store the latest received character
+
+//Need to synchronize the data being received by looking for the 's' which denotes the start of the array
+    if ((uartcount == 0) && (ReceivedChar == 's'))  //Note: uartcount=0 until we receive a 's'
+    {
+        ReceiveDataArray[uartcount] = ReceivedChar; //Store 's' into the 0 element of the array
+        uartcount++;                                //Increment array index for next byte being received
+    }
+    else if (uartcount != 0)
+//Data has been synchronized; update the array of data being received until buffer size has been reached
+    {
+        ReceiveDataArray[uartcount] = ReceivedChar; //Update array with the latest data byte being received
+        uartcount++;                                //Increment array index for next byte being received
+        if (uartcount==BUFF_SIZE) uartcount=0;      //All data in array has been received
+    }
+     EnableIntU1RX;             //Enable the UART1 receive interrupt
+}
+void InitPWM(void)  //REVISED BY Andrew 10/29/19 Enables PWM 
+{
+	DisableIntT2;		//Disable Timer2 Interrupt
+	DisableIntOC1;		//Disable OC1 Interrupt
+	DisableIntOC2;		//Disable OC2 Interrupt
+                        //Timer2 is the clock source for OC1 and OC2
+                        //Configure PWM mode for OC1 and OC2
+	OpenOC1(OC_IDLE_CON & OC_TIMER2_SRC & OC_PWM_FAULT_PIN_DISABLE, 1, 1);
+	OpenOC2(OC_IDLE_CON & OC_TIMER2_SRC & OC_PWM_FAULT_PIN_DISABLE, 1, 1);							
+                        //Prescaler = 1:1 and Period = 0xFFFF
+	OpenTimer2(T2_ON & T2_IDLE_CON & T2_GATE_OFF & T2_PS_1_1 & T2_32BIT_MODE_OFF & T2_SOURCE_INT, 0xFFFF);
+}
+void Drive(void)   //Enables Drive function
+{	 
+   
+	switch (Direction)          //switch statement that runs code 
+    {                           //depending on the value of Direction
+    case 0:                     //10/29/19 off
+    
+        LATBbits.LATB10 = 1;    //Enable motors to stop
+        break;
+    
+    case 1:                     //direction both forward
+    
+        LATBbits.LATB10 = 0;    //Enable motors to run
+        LATBbits.LATB13 = 0;    //Set the direction of motor 1 to be Forward
+        LATBbits.LATB11 = 0;    //Set the direction of motor 2 to be Forward
+        SetDCOC1PWM(PWM1);      //Set duty cycle PWM1 on OC1 
+        
+        break;
+    
+    case 2:                     // turn right 
+    
+        LATBbits.LATB10 = 0;    //Enable motors to run
+        LATBbits.LATB13 = 0;    //Set the direction of motor 1 to be Forward
+        LATBbits.LATB11 = 1;    //Set the direction of motor 2 to be Reverse
+        SetDCOC1PWM(PWM1);      //Set duty cycle PWM1
+        
+        break;
+    
+    case 3:                     //both reverse
+    
+        LATBbits.LATB10 = 0;    //Enable motors to run
+        LATBbits.LATB13 = 1;    //Set the direction of motor 1 to be Reverse
+        LATBbits.LATB11 = 1;    //Set the direction of motor 2 to be Reverse
+        SetDCOC1PWM(PWM1);      //Set duty cycle PWM1
+        
+        break;
+    
+    case 4:                     //turn left 
+    
+        LATBbits.LATB10 = 0;    //Enable motors to run
+        LATBbits.LATB13 = 1;    //Set the direction of motor 1 to be Reverse
+        LATBbits.LATB11 = 0;    //Set the direction of motor 2 to be Forward
+        SetDCOC1PWM(PWM1);      //Set duty cycle PWM1
+        
+        break;
+    
+    }
+}
+void ArmPosition(void)   //function to move arm 
+{	 
+   
+	switch (ArmDirection)          //switch statement that runs code 
+    {                           //depending on the value of ArmDirection
+    case 0:                     //off
+    
+        LATAbits.LATA1 = 1;    //Enable vertical motor to stop
+        LATBbits.LATB1 = 1;    //Enable rotational motor to stop
+        break;
+    
+    case 1:                     //rotation clockwise
+    
+        LATAbits.LATA1 = 1;    //Enable vertical motor to stop
+        LATBbits.LATB1 = 0;    //Enable rotational motor to run     
+        LATBbits.LATB0 = 1;    //set direction of rotational motors to be 1 
+        SetDCOC2PWM(PWM2);      //Set duty cycle PWM2
+        break;
+    
+    case 2:                     //rotation counter clockwise 
+    
+        LATAbits.LATA1 = 1;    //Enable vertical motor to stop
+        LATBbits.LATB1 = 0;    //Enable rotational motor to run     
+        LATBbits.LATB0 = 0;    //set direction of rotational motors to be 0 
+        SetDCOC2PWM(PWM2);      //Set duty cycle PWM2
+        break;
+    
+    case 3:                     //vertical movement up
+    
+        while(ArmVertLS !=1)     //raise arm until the top 
+               {
+                     LATAbits.LATA1 = 0;    //Enable vertical motor to run
+                     LATBbits.LATB1 = 1;    //Enable rotational motor to stop     
+                     LATBbits.LATB2 = 1;    //set direction of vertical motors to be 1 
+                     SetDCOC2PWM(PWM2);      //Set duty cycle PWM2
+               }
+    
+    case 4:                     //vertical movement down 
+    
+        LATAbits.LATA1 = 0;    //Enable vertical motor to run
+        LATBbits.LATB1 = 1;    //Enable rotational motor to stop     
+        LATBbits.LATB2 = 0;    //set direction of vertical motors to be 0 
+        SetDCOC2PWM(PWM2);      //Set duty cycle PWM2
+        break;
+    
+    }
+}
+void Compare(void)
+{
+	if (LineLeft > LineRight)	//Checks which motor to run if robot is going towards 
+	{									
+        if ((LineLeft - LineRight)<= 200) //since the sensors will likely not be equal they need a range, if within that range go straight 
+        {                                   // Range was found experimentally by reading values 
+            LATBbits.LATB10 = 0;    //Enable motors to run
+            LATBbits.LATB13 = 0;    //Set the direction of motor 1 to be Forward
+            LATBbits.LATB11 = 0;    //Set the direction of motor 2 to be Forward
+            SetDCOC1PWM(PWM1);      //Set duty cycle PWM1
+        }
+        else //if they are not within the range then go right 
+        {
+                
+            LATBbits.LATB10 = 0;    //Enable motors to run
+            LATBbits.LATB13 = 0;    //Set the direction of motor 1 to be Forward
+            LATBbits.LATB11 = 1;    //Set the direction of motor 2 to be Reverse
+            SetDCOC1PWM(PWM1);      //Set duty cycle PWM1
+        }	
+    }
+    
+	else if (LineLeft < LineRight)				
+	{
+		if ((LineRight - LineLeft)<= 200) //Revised by Fernando since the sensors will likely not be equal they need a range, if within that range go straight 
+        {
+            LATBbits.LATB10 = 0;    //Enable motors to run
+            LATBbits.LATB13 = 0;    //Set the direction of motor 1 to be Forward
+            LATBbits.LATB11 = 0;    //Set the direction of motor 2 to be Forward
+            SetDCOC1PWM(PWM1);      //Set duty cycle PWM1
+        }
+        else        //go left 
+            
+        {
+            LATBbits.LATB10 = 0;    //Enable motors to run
+            LATBbits.LATB13 = 1;    //Set the direction of motor 1 to be Reverse
+            LATBbits.LATB11 = 0;    //Set the direction of motor 2 to be Forward
+            SetDCOC1PWM(PWM1);      //Set duty cycle PWM1
+        }
+	}   
+}
